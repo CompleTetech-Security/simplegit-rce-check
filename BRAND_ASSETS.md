@@ -13,5 +13,6 @@ screenshots are an illustrative layout built from placeholder rows on reserved
 `example.*` domains; they are not results from any checker or assessment.
 
 This repository also uses a text attribution linking to
-[complete.tech](https://complete.tech). It includes no logo file. Any future
+[complete.tech](https://complete.tech). It includes no standalone logo file; the CompleteTech LLC logo appears only
+inside the images in `docs/images/`. Any future
 report branding must respect the rights of its owner.

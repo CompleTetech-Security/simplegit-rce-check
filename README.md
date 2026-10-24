@@ -118,8 +118,8 @@ checker commands, downloadable binaries, test results, or CI claims.
 
 ## Primary sources
 
-1. [github.com](https://github.com/steveukx/git-js/security/advisories/GHSA-g4wm-2vf7-vfgr)
-2. [github.com](https://github.com/advisories/GHSA-g4wm-2vf7-vfgr)
+1. Repository advisory: [github.com](https://github.com/steveukx/git-js/security/advisories/GHSA-g4wm-2vf7-vfgr)
+2. GitHub Advisory Database: [github.com](https://github.com/advisories/GHSA-g4wm-2vf7-vfgr)
 
 The research date records the supplied verification snapshot. Recheck primary
 advisories before enabling any detection logic, and retain contradictory evidence.
