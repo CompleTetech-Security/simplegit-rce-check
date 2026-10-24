@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "package": "simple-git",
+  "package_version": "4.0.0",
+  "label": "example-package-instance",
+  "build_source": "unknown",
+  "attacker_influence_over_clone_mirror_customargs": null,
+  "attacker_controlled_readable_git_configuration_file": null,
+  "remote_operation_loads_unsafe_configuration": null
+}
