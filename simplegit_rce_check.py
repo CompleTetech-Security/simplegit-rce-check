@@ -343,7 +343,7 @@ def _segments(values, start, end, pairs):
 def _argument_shape(values, start, end, pairs):
     if start >= end:
         return "missing"
-    if end == start + 1 and values[start] == "@string":
+    if end == start + 1 and values[start] in {"@string", "@simple-git", "@config", "@customArgs"}:
         return "literal_string"
     if values[start] in {"[", "{"} and pairs.get(start) == end - 1:
         if "..." in values[start:end]:

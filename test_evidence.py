@@ -44,6 +44,9 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual("clone", self.scan("const client=require('simple-git')(); client.clone(repo);")[0]["source_operation"])
 
     def test_factory_config_and_constants_are_shapes_not_trust(self):
+        for value in ["simple-git", "config", "customArgs"]:
+            row = self.scan("import git from 'simple-git'; git().clone('" + value + "');")[0]
+            self.assertEqual("literal_string", row["source_argument_shapes"])
         cases = [
             ("{config:['constant']}", "array_literal"),
             ("{config:request.options}", "dynamic_or_unsupported"),
