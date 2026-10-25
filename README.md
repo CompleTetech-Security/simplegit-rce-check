@@ -36,7 +36,58 @@ The reviewed fixed line is `4.x`; future lines remain unknown rather than extrap
 | `attacker_controlled_readable_git_configuration_file` | attacker-controlled readable Git configuration file |
 | `remote_operation_loads_unsafe_configuration` | remote operation loads unsafe configuration |
 
-Each observation is boolean or null, is unverified, and never changes the package-version result. No source search, taint analysis, reachability test, or runtime evaluation is performed. Absent observations do not establish mitigation.
+Each observation is boolean or null, is unverified, and never changes the package-version result. Optional lexical source inspection is separate. No taint analysis, reachability test or runtime evaluation is performed. Absent observations do not establish mitigation.
+
+## Dependency and source evidence
+
+```sh
+python simplegit_rce_check.py --npm-lock examples/package-lock.example.json --format json
+python simplegit_rce_check.py --source examples/source.example.js --source-root examples --format html
+python simplegit_rce_check.py --installed-package path/to/node_modules/simple-git/package.json --format json
+```
+
+`--npm-lock` reads explicitly named npm lock/shrinkwrap v1/v2/v3 JSON. Nested
+instances and aliases carrying an explicit package name remain separate.
+Resolved versions are not proof of deployment; linked packages, missing/qualified
+versions, conflicting primary/legacy lock records and unsupported coverage keep
+uncertainty. Conflicting version candidates are retained. When no determinable
+instance is found, the report includes an unknown coverage observation, never proof of absence.
+`--installed-package` reads the name/version of an explicitly selected installed
+simple-git manifest, without running scripts or importing the module. Manifest
+metadata cannot attest that a serving process loads that package.
+
+`--source` explicitly selects JS/TS files and requires `--source-root` for
+relative locations. No directory traversal or execution occurs. Simple literal
+CommonJS/ES imports (default/named aliases and namespace `simpleGit`), factory
+calls, directly assigned client spellings, and clone/mirror argument shapes
+produce lexical review candidates. Factory `config` and actual call arguments
+are inspected separately; an unrelated same-file `customArgs` or config object
+cannot establish a flow. Argument labels describe literal containers/strings or
+dynamic expressions, not input trust. Identifiers named trustedConfig or
+request.body do not prove trusted input or attacker control.
+
+Shadowing, reassignment, computed syntax, templates (including interpolation),
+callbacks, chained methods, execution order and regex/division ambiguity require
+manual review. Source rows always remain `unknown` with `not_tested`
+exploitability and unfilled operator observations; they never inherit the status
+of a separately supplied version/manifest/lock instance. When no supported candidate
+is found, the report includes an explicit unknown coverage row rather than an absence verdict.
+
+All new input modes share existing 4 MiB/file, 100-file and 10,000-result limits.
+Lock traversal is limited to 64 dependency levels and 10,000 metadata entries;
+source is limited to 200,000 tokens/file and 4,096 tokens per inspected argument
+window. Source files must resolve within the selected root. Output protection
+covers every new input and its aliases even with --force. Stable copies are
+recommended; file checks are not a filesystem sandbox. The checker performs no
+Git, npm, network, application or sandbox execution.
+
+JSON/CSV schema 1.1 adds `version_candidates`, `source_path`, `source_line`,
+`source_operation`, `source_argument_shapes`, `source_factory_options`,
+`source_config_argument` and `source_coverage`. HTML includes candidates and
+locations in escaped evidence notes. Source strings/snippets, registry URLs and
+manifest scripts are not included in reports. The standalone executable bundles
+its lexer from vm2-nesting-check commit 1618874 under the same licensing; no
+companion checkout is needed. Version rules and their date are unchanged.
 
 ## Evidence and reports
 
@@ -58,3 +109,5 @@ CSV `record_type=result` rows are asset observations. A zero-result report has a
 CSV rejects NUL characters before writing a report. An interruption after a complete report is published preserves that report and exits 130.
 
 If an interrupt leaves file publication indeterminate, the checker exits 130 without retrying. Inspect the output before retrying; the diagnostic does not establish whether publication succeeded.
+
+Npm metadata grammar: [official package-lock reference](https://docs.npmjs.com/cli/v11/configuring-npm/package-lock-json/), reviewed 2026-10-25. Lockfile URLs and scripts are not collected.

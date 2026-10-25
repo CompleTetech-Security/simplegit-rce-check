@@ -21,8 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 TOOL_NAME = "simplegit-rce-check"
-TOOL_VERSION = "1.0.0"
-REPORT_SCHEMA_VERSION = "1.0"
+TOOL_VERSION = "1.1.0"
+REPORT_SCHEMA_VERSION = "1.1"
 MAX_INPUT_BYTES = 4 * 1024 * 1024
 MAX_ENTRIES = 10000
 MAX_FIELD = 512
@@ -146,9 +146,11 @@ def assess_version(package_version="", *, version_candidates=None, build_source=
 PRECONDITION_KEYS = tuple(key for key, _ in PRECONDITIONS)
 OBSERVATIONS = {True: "reported_true", False: "reported_false", None: "not_reported"}
 INVENTORY_FIELDS = {"schema_version", "package", "label", "package_version", "build_source", *PRECONDITION_KEYS}
+SOURCE_COLUMNS = ["source_path", "source_line", "source_operation", "source_argument_shapes", "source_factory_options", "source_config_argument", "source_coverage"]
 CSV_COLUMNS = ["record_type", "input_label", "input_source", "package_version", "build_source", "status", "version_status", "fixed_version",
                "exploitability", "evidence_type", "evidence_confidence", "cve", "rules_as_of", *[f"precondition_{key}" for key in PRECONDITION_KEYS],
                "recommendation", "notes", "sources", "report_schema_version", "report_complete"]
+CSV_COLUMNS += SOURCE_COLUMNS + ["version_candidates"]
 STATUS_ORDER = {"potentially_affected": 0, "unknown": 2, "fixed_version_reported": 3}
 STATUS_LABELS = {"potentially_affected": "Potentially affected", "unknown": "Unknown", "fixed_version_reported": "Fixed version reported"}
 
@@ -224,6 +226,356 @@ def _read_bounded(path):
     if len(raw) > MAX_INPUT_BYTES:
         raise ValueError("Input file exceeds the 4 MiB limit")
     return raw.decode("utf-8-sig")
+
+
+# Bounded lexer bundled from vm2-nesting-check 1618874; same CompleteTech licensing.
+def _js_tokens(text):
+    """Bounded lexical hints, not a JavaScript parser. Never retain source strings."""
+    tokens = []
+    index, line = 0, 1
+    while index < len(text):
+        start = index
+        char = text[index]
+        if char.isspace():
+            line += char == "\n"
+            index += 1
+            continue
+        if text.startswith("//", index):
+            end = text.find("\n", index)
+            index = len(text) if end < 0 else end
+            continue
+        if text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            if end < 0:
+                raise ValueError("Unterminated JavaScript comment")
+            line += text.count("\n", index, end + 2)
+            index = end + 2
+            continue
+        token_line = line
+        if char in "\"'`":
+            index += 1
+            while index < len(text):
+                if text[index] == "\\":
+                    index += 2
+                elif text[index] == char:
+                    index += 1
+                    break
+                else:
+                    index += 1
+            else:
+                raise ValueError("Unterminated JavaScript string or template")
+            raw = text[start + 1:index - 1]
+            value = "@template" if char == "`" else "@" + raw if raw in {"simple-git", "config", "customArgs"} else "@string"
+            line += text.count("\n", start, index)
+        elif char == "/" and (not tokens or tokens[-1][0] in {"=", "(", "[", "{", ":", ",", ";", "return", "=>"}):
+            # Regex bodies are opaque. Templates (including interpolations) are
+            # also opaque; the report always states incomplete lexical coverage.
+            index += 1
+            in_class = False
+            while index < len(text):
+                c = text[index]
+                if c == "\\":
+                    index += 2
+                    continue
+                if c == "[":
+                    in_class = True
+                elif c == "]":
+                    in_class = False
+                elif c == "/" and not in_class:
+                    index += 1
+                    break
+                elif c == "\n":
+                    raise ValueError("Unterminated JavaScript regex candidate")
+                index += 1
+            else:
+                raise ValueError("Unterminated JavaScript regex candidate")
+            value = "@regex"
+        elif char.isascii() and (char.isalpha() or char in "_$"):
+            index += 1
+            while index < len(text) and text[index].isascii() and (text[index].isalnum() or text[index] in "_$"):
+                index += 1
+            value = text[start:index]
+        elif text.startswith("...", index):
+            value, index = "...", index + 3
+        else:
+            value, index = char, index + 1
+        tokens.append((value, token_line))
+        if len(tokens) > 200000:
+            raise ValueError("Source exceeds the 200,000 token limit")
+    return tokens
+
+
+
+
+def _token_pairs(values):
+    stack, pairs = [], {}
+    for index, value in enumerate(values):
+        if value in {"{", "[", "("}:
+            stack.append(index)
+        elif value in {"}", "]", ")"}:
+            if not stack or values[stack[-1]] != {"}": "{", "]": "[", ")": "("}[value]:
+                raise ValueError("Unbalanced JavaScript delimiters")
+            opening = stack.pop()
+            pairs[opening] = index
+    if stack:
+        raise ValueError("Unbalanced JavaScript delimiters")
+    return pairs
+
+
+def _segments(values, start, end, pairs):
+    """Top-level argument/property slices with a bounded inspection window."""
+    if end - start > 4096:
+        return None
+    parts, index, first = [], start, start
+    while index < end:
+        if values[index] in {"(", "[", "{"} and index in pairs:
+            index = pairs[index] + 1
+            continue
+        if values[index] == ",":
+            parts.append((first, index))
+            first = index + 1
+        index += 1
+    if first < end:
+        parts.append((first, end))
+    return parts
+
+
+def _argument_shape(values, start, end, pairs):
+    if start >= end:
+        return "missing"
+    if end == start + 1 and values[start] == "@string":
+        return "literal_string"
+    if values[start] in {"[", "{"} and pairs.get(start) == end - 1:
+        if "..." in values[start:end]:
+            return "dynamic_or_unsupported"
+        return "array_literal" if values[start] == "[" else "object_literal"
+    return "dynamic_or_unsupported"
+
+
+def _simplegit_factories(values):
+    factories, namespaces = set(), set()
+    ident = r"[A-Za-z_$][A-Za-z0-9_$]*"
+    for index, value in enumerate(values):
+        if value not in {"const", "let", "var", "import"}:
+            continue
+        end = index + 1
+        while end < min(len(values), index + 100) and values[end] != ";":
+            end += 1
+        statement = " ".join(values[index:end])
+        if value == "import":
+            m = re.match(r"import (" + ident + r") from @simple-git(?: |$)", statement)
+            if m:
+                factories.add(m[1])
+            m = re.match(r"import \* as (" + ident + r") from @simple-git(?: |$)", statement)
+            if m:
+                namespaces.add(m[1])
+            m = re.match(r"import \{ (.*?) \} from @simple-git(?: |$)", statement)
+            if m:
+                for member in re.split(r"\s*,\s*", m[1]):
+                    member = re.fullmatch(r"simpleGit(?: as (" + ident + r"))?", member)
+                    if member:
+                        factories.add(member[1] or "simpleGit")
+        else:
+            m = re.match(r"(?:const|let|var) (" + ident + r") = require \( @simple-git \)(.*)", statement)
+            if m and (not m[2].startswith(" .") or re.match(r" \. simpleGit(?: |$)", m[2])):
+                factories.add(m[1])
+            m = re.match(r"(?:const|let|var) \{ (.*?) \} = require \( @simple-git \)", statement)
+            if m:
+                for member in re.split(r"\s*,\s*", m[1]):
+                    member = re.fullmatch(r"simpleGit(?: : (" + ident + r"))?", member)
+                    if member:
+                        factories.add(member[1] or "simpleGit")
+    return factories, namespaces
+
+
+def _factory_shapes(values, opening, pairs):
+    closing = pairs[opening]
+    args = _segments(values, opening + 1, closing, pairs)
+    if args is None:
+        return "dynamic_or_unsupported", "unknown"
+    if not args:
+        return "no_arguments", "not_observed"
+    start, end = args[0]
+    shape = _argument_shape(values, start, end, pairs)
+    if shape != "object_literal":
+        return shape, "unknown"
+    props = _segments(values, start + 1, end - 1, pairs)
+    keys, config = set(), "not_observed"
+    for first, last in props or []:
+        if last - first < 3 or values[first + 1] != ":":
+            return shape, "unknown"
+        key = values[first].removeprefix("@")
+        if key in keys:
+            return shape, "unknown"
+        keys.add(key)
+        if key == "config":
+            config = _argument_shape(values, first + 2, last, pairs)
+    return shape, config
+
+
+def scan_source_text(text, relative_path):
+    tokens = _js_tokens(text)
+    values = [token[0] for token in tokens]
+    pairs = _token_pairs(values)
+    factories, namespaces = _simplegit_factories(values)
+    clients, direct = {}, {}
+    for index, value in enumerate(values[:-1]):
+        opening = None
+        if value in factories and values[index + 1] == "(":
+            opening = index + 1
+        elif (index + 3 < len(values) and value in namespaces
+              and values[index + 1:index + 4] == [".", "simpleGit", "("]):
+            opening = index + 3
+        elif index + 4 < len(values) and values[index:index + 5] == ["require", "(", "@simple-git", ")", "("]:
+            opening = index + 4
+        if opening is None or opening not in pairs:
+            continue
+        shape = _factory_shapes(values, opening, pairs)
+        direct[pairs[opening]] = shape
+        if index >= 2 and values[index - 1] == "=":
+            clients[values[index - 2]] = shape
+    rows = []
+    for index in range(len(values) - 3):
+        if values[index + 1] != "." or values[index + 2] not in {"clone", "mirror"} or values[index + 3] != "(":
+            continue
+        shape = direct.get(index) if values[index] == ")" else clients.get(values[index])
+        if shape is None:
+            continue
+        args = _segments(values, index + 4, pairs[index + 3], pairs)
+        shapes = "unknown" if args is None else ",".join(_argument_shape(values, a, b, pairs) for a, b in args) or "no_arguments"
+        row = assess_entry(relative_path, "source", "")
+        row.update(evidence_type="lexical_source_candidate", source_path=relative_path,
+                   source_line=tokens[index + 2][1], source_operation=values[index + 2],
+                   source_argument_shapes=shapes, source_factory_options=shape[0],
+                   source_config_argument=shape[1], source_coverage="limited_lexical")
+        row["notes"].append(
+            f"Source candidate {relative_path}:{tokens[index + 2][1]}: {values[index + 2]}; arguments={shapes}; "
+            f"factory_options={shape[0]}; config={shape[1]}. Constants, variables and object/array shapes do not prove trust or taint. "
+            "Shadowing, reassignment, execution order, templates, callbacks and unsupported syntax need manual review; no match is not absence.")
+        rows.append(row)
+        if len(rows) > MAX_ENTRIES:
+            raise ValueError("Too many source candidates")
+    if not rows:
+        row = assess_entry(relative_path, "source", "")
+        row.update(evidence_type="source_coverage", source_path=relative_path, source_line="",
+                   source_operation="not_observed", source_argument_shapes="unknown",
+                   source_factory_options="unknown", source_config_argument="unknown", source_coverage="limited_lexical")
+        row["notes"].append("No supported import-associated clone/mirror candidate found; package presence and input trust remain unknown.")
+        rows.append(row)
+    return rows
+
+
+def load_source(path, root, budget, out):
+    budget.add_file()
+    relative = Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
+    _bounded_text(relative, "Source relative path")
+    rows = scan_source_text(_read_bounded(path), relative)
+    budget.add_entries(len(rows))
+    out.extend(rows)
+
+
+def _metadata_json(path):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate metadata key")
+            result[key] = value
+        return result
+    def reject(_):
+        raise ValueError("Non-finite metadata number")
+    result = json.loads(_read_bounded(path), object_pairs_hook=unique, parse_constant=reject)
+    if not isinstance(result, dict):
+        raise ValueError("Package metadata must be a JSON object")
+    return result
+
+
+def load_installed_package(path, budget, out):
+    budget.add_file()
+    data = _metadata_json(path)
+    if data.get("name") != "simple-git":
+        raise ValueError("Installed manifest must identify simple-git")
+    version = _bounded_text(data.get("version", ""), "Package version")
+    budget.add_entries(1)
+    row = assess_entry("simple-git installed manifest", "installed_manifest", version)
+    row["evidence_type"] = "installed_manifest_version"
+    row["notes"].append("Explicitly selected installed package manifest; not evidence that a deployed process loads it. Scripts and URLs are not collected or executed.")
+    out.append(row)
+
+
+def _legacy_instances(dependencies):
+    pending = [(dependencies, "", 0)]
+    result, count = {}, 0
+    while pending:
+        entries, prefix, depth = pending.pop()
+        if not isinstance(entries, dict) or depth > 64:
+            raise ValueError("Unsupported dependency tree or depth")
+        for name, item in entries.items():
+            count += 1
+            if count > MAX_ENTRIES or not isinstance(item, dict):
+                raise ValueError("Invalid or excessive dependency metadata")
+            location = prefix + "node_modules/" + name
+            _bounded_text(location, "Dependency location")
+            if location.startswith("/") or "\\" in location or ":" in location or any(p in {".", ".."} for p in location.split("/")):
+                raise ValueError("Dependency location must be a relative npm path")
+            if name == "simple-git" or item.get("name") == "simple-git" or str(item.get("version", "")).startswith("npm:simple-git@"):
+                result[location] = item
+            if "dependencies" in item:
+                pending.append((item["dependencies"], location + "/", depth + 1))
+    return result
+
+
+def load_npm_lock(path, budget, out):
+    budget.add_file()
+    data = _metadata_json(path)
+    lock_version = data.get("lockfileVersion")
+    if type(lock_version) is not int or lock_version not in {1, 2, 3}:
+        raise ValueError("Only npm lockfile versions 1, 2 and 3 are supported")
+    legacy = _legacy_instances(data.get("dependencies", {}))
+    if lock_version == 1 and "packages" in data:
+        raise ValueError("Conflicting lockfile version and package metadata")
+    instances = legacy
+    conflict = False
+    if lock_version in {2, 3}:
+        packages = data.get("packages")
+        if not isinstance(packages, dict) or len(packages) > MAX_ENTRIES:
+            raise ValueError("Lockfile packages must be a bounded object")
+        instances = {}
+        for location, item in packages.items():
+            if not isinstance(item, dict) or len(location) > MAX_FIELD:
+                raise ValueError("Invalid package metadata")
+            if location.startswith("/") or "\\" in location or ":" in location or any(p in {".", ".."} for p in location.split("/")):
+                raise ValueError("Package location must be a relative npm path")
+            if "link" in item and type(item["link"]) is not bool:
+                raise ValueError("Package link flag must be boolean")
+            if location == "node_modules/simple-git" or location.endswith("/node_modules/simple-git") or item.get("name") == "simple-git":
+                instances[location] = item
+        if legacy:
+            conflict = {k: v.get("version") for k, v in instances.items()} != {k: v.get("version") for k, v in legacy.items()}
+            if conflict:
+                instances = {**legacy, **instances}
+    rows = []
+    for location, item in sorted(instances.items()):
+        if "name" in item and item["name"] != "simple-git":
+            raise ValueError("Conflicting simple-git package identity")
+        if "link" in item and type(item["link"]) is not bool:
+            raise ValueError("Package link flag must be boolean")
+        version = _bounded_text(item.get("version", ""), "Dependency version")
+        row = assess_entry(location, "npm_lockfile", "" if item.get("link") or conflict else version)
+        row["evidence_type"] = "npm_lockfile_resolved_version"
+        if item.get("link") or conflict:
+            row["notes"].append("Linked or conflicting lockfile metadata cannot establish a package version; inspect the installed manifest.")
+        row["version_candidates"] = sorted({version, _bounded_text(legacy.get(location, {}).get("version", ""), "Legacy dependency version")} - {""})
+        if row["version_candidates"]:
+            row["notes"].append("Reported version candidates: " + ", ".join(row["version_candidates"]))
+        row["notes"].append("Lockfile-resolved instance, not deployed runtime attestation. Registry URLs, scripts and package data are not collected.")
+        rows.append(row)
+    if not rows:
+        row = assess_entry("npm lockfile coverage", "npm_lockfile", "")
+        row["notes"].append("No determinable simple-git instance found in supported lock metadata; package absence is not established.")
+        rows.append(row)
+    budget.add_entries(len(rows))
+    out.extend(rows)
 
 
 class Budget:
@@ -520,10 +872,19 @@ def _validate_arguments(args):
         _bounded_text(version, "--version")
     if len(args.package_version) > MAX_ENTRIES:
         raise ValueError(f"A run is limited to {MAX_ENTRIES:,} inputs")
-    if len(args.inventory) + len(args.csv_list) > MAX_FILES:
+    inputs = (*args.inventory, *args.csv_list, *args.source, *args.npm_lock, *args.installed_package)
+    if len(inputs) > MAX_FILES:
         raise ValueError(f"A run is limited to {MAX_FILES} input files")
-    for path in (*args.inventory, *args.csv_list):
+    if args.source and args.source_root is None:
+        raise ValueError("--source requires --source-root for relative evidence paths")
+    if args.source_root is not None and not args.source_root.is_dir():
+        raise ValueError("--source-root must be a directory")
+    for path in inputs:
         _require_regular_file(path)
+    for path in args.source:
+        if path.suffix.lower() not in {".js", ".cjs", ".mjs", ".ts", ".cts", ".mts", ".jsx", ".tsx"}:
+            raise ValueError("Source must be an explicitly selected JS/TS file")
+        path.resolve().relative_to(args.source_root.resolve())
     if args.output is not None:
         output = args.output
         parent = output.parent
@@ -536,10 +897,10 @@ def _validate_arguments(args):
                 raise ValueError("Output is a dangling or looping symbolic link")
             if output.is_dir() or (output.exists() and not stat.S_ISREG(os.stat(output).st_mode)):
                 raise ValueError("Output must be a regular file path")
-            for path in (*args.inventory, *args.csv_list):
+            for path in inputs:
                 if os.path.samefile(output, path):
                     raise ValueError("--output must differ from every input file, even with --force")
-        for path in (*args.inventory, *args.csv_list):
+        for path in inputs:
             if os.path.realpath(output) == os.path.realpath(path):
                 raise ValueError("--output must differ from every input file, even with --force")
 
@@ -562,6 +923,14 @@ def main(argv=None):
                         help="JSON object or array of entries (see docs/REFERENCE.md); repeatable")
     parser.add_argument("--csv-list", action="append", default=[], type=Path, metavar="FILE",
                         help="CSV with a package_version column and optional label, build_source and precondition columns; repeatable")
+    parser.add_argument("--npm-lock", action="append", default=[], type=Path, metavar="FILE",
+                        help="Explicit npm package-lock/shrinkwrap JSON (versions 1, 2, 3); never invokes npm")
+    parser.add_argument("--installed-package", action="append", default=[], type=Path, metavar="FILE",
+                        help="Explicit installed simple-git package.json; reads only name/version metadata")
+    parser.add_argument("--source", action="append", default=[], type=Path, metavar="FILE",
+                        help="Explicit JS/TS file for lexical clone/mirror candidates; repeatable, never executed")
+    parser.add_argument("--source-root", type=Path, metavar="DIR",
+                        help="Required with --source; evidence paths are relative to this directory")
     parser.add_argument("--format", choices=("csv", "json", "html"), default="csv", help="Output format (default: csv)")
     parser.add_argument("--output", type=Path, help="Save report to a new file; default: stdout")
     parser.add_argument("--force", action="store_true", help="Replace an existing output file explicitly")
@@ -569,8 +938,8 @@ def main(argv=None):
     parser.add_argument("--fail-on-finding", action="store_true",
                         help="Exit 1 for potentially_affected results (errors still exit 2)")
     args = parser.parse_args(argv)
-    if not (args.package_version or args.inventory or args.csv_list):
-        parser.error("provide --version, --inventory or --csv-list")
+    if not (args.package_version or args.inventory or args.csv_list or args.npm_lock or args.installed_package or args.source):
+        parser.error("provide --version, --inventory, --csv-list, --npm-lock, --installed-package or --source")
     rows = []
     state = {"validated": False, "published": False, "stdout_started": False}
     options = {"force": args.force, "format": args.format, "brand": args.brand, "state": state}
@@ -587,6 +956,12 @@ def main(argv=None):
                 load_inventory(path, budget, rows)
             for path in args.csv_list:
                 load_csv_list(path, budget, rows)
+            for path in args.npm_lock:
+                load_npm_lock(path, budget, rows)
+            for path in args.installed_package:
+                load_installed_package(path, budget, rows)
+            for path in args.source:
+                load_source(path, args.source_root, budget, rows)
             save_report(args.output, rows, complete=True, **options)
         except KeyboardInterrupt:
             if not state["validated"]:
