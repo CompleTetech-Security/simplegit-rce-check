@@ -22,6 +22,10 @@ class EvidenceTests(unittest.TestCase):
     def scan(self, code):
         return c.scan_source_text(code, "src/worker.ts")
 
+    def test_arrow_return_regex_body_is_opaque(self):
+        rows = self.scan("const pattern = () => /const git = require('simple-git'); git().clone(repo)/;")
+        self.assertEqual(["source_coverage"], [row["evidence_type"] for row in rows])
+
     def test_javascript_line_terminators_preserve_comment_boundaries(self):
         for ending in ("\n", "\r\n", "\r", "\u2028", "\u2029"):
             with self.subTest(ending=repr(ending)):
