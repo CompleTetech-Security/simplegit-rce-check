@@ -22,6 +22,13 @@ class EvidenceTests(unittest.TestCase):
     def scan(self, code):
         return c.scan_source_text(code, "src/worker.ts")
 
+    def test_javascript_line_terminators_preserve_comment_boundaries(self):
+        for ending in ("\n", "\r\n", "\r", "\u2028", "\u2029"):
+            with self.subTest(ending=repr(ending)):
+                rows = self.scan(("// comment\n" + "import git from 'simple-git';\ngit().clone(repo);").replace("\n", ending))
+                self.assertEqual("lexical_source_candidate", rows[0]["evidence_type"])
+                self.assertEqual(3, rows[0]["source_line"])
+
     def test_import_aliases_instances_and_direct_factory_chains(self):
         for declaration, factory in [
             ("import git from 'simple-git';", "git"),

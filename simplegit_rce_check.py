@@ -231,6 +231,7 @@ def _read_bounded(path):
 # Bounded lexer bundled from vm2-nesting-check 1618874; same CompleteTech licensing.
 def _js_tokens(text):
     """Bounded lexical hints, not a JavaScript parser. Never retain source strings."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\u2028", "\n").replace("\u2029", "\n")
     tokens = []
     index, line = 0, 1
     while index < len(text):
