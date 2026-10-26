@@ -1,3 +1,14 @@
+<p align="center">
+  <img src="docs/images/banner.png" alt="simplegit-rce-check by CompleteTech LLC" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/CompleTetech-Security/simplegit-rce-check/actions"><img src="https://img.shields.io/github/actions/workflow/status/CompleTetech-Security/simplegit-rce-check/tests.yml?label=tests" alt="Tests"></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-1E3A8A" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/dependencies-none-067647" alt="No runtime dependencies">
+  <a href="LICENSING.md"><img src="https://img.shields.io/badge/license-AGPL--3.0%20%7C%20commercial-64748B" alt="AGPL-3.0 or commercial license"></a>
+</p>
+
 # simplegit-rce-check
 
 Offline evidence checker for **CVE-2026-102826 — simple-git configuration include command injection**. Python 3.10+, standard library only. The executable can be copied alone. It never contacts websites, imports application code, runs a package manager, or executes exploit payloads.
@@ -9,6 +20,15 @@ python simplegit_rce_check.py --csv-list inventory.csv --fail-on-finding
 python simplegit_rce_check.py --help
 python -m unittest -v
 ```
+
+## Synthetic report preview
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/report-dark.png">
+  <img src="docs/images/report-light.png" alt="simple-git synthetic report" width="100%">
+</picture>
+
+[Open the synthetic example report](docs/example-report.html). Example data only; this is not a live assessment.
 
 ## Reviewed rules
 
